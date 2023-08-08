@@ -1,0 +1,376 @@
+```{r}
+library(data.table)
+library(stringr)
+library(reshape2)
+library(pheatmap)
+
+library(caret)
+library(ggplot2)
+library(glmnet)
+library(doParallel)
+library(ROCR)
+library(pROC)
+library(Matrix)
+library(sva)
+library("randomForest")
+library(xgboost)
+```
+
+
+```{r}
+pc_sample_info3<-read.table("/patht0/pc_sample_anno0914.txt",sep="\t",header=T,row.names = 1)
+
+rownames(pc_sample_info3)<-pc_sample_info3$Index_IC
+normal_sample_info<-subset(pc_sample_info3,Group=="BiopsyNegative" | Group=="Healthy")
+early_sample_info<-subset(pc_sample_info3,Group=="localized" | Group=="locally_advanced")
+
+
+
+rerun_samples <-list.dirs("cnv",recursive = F)
+
+cnv_tab<-data.frame()
+for (rerun_sample in rerun_samples){
+  samp_prefix = str_split(rerun_sample,"\\/",simplify = T)[2]
+  cnv_file = read.table(paste0(rerun_sample,"/tumor_sample.cna.seg"),sep='\t',header=T)
+  rownames(cnv_file)=paste(cnv_file[,1],cnv_file[,2],cnv_file[,3],sep=":")
+  cnv_tab[rownames(cnv_file),samp_prefix] = cnv_file[,6]
+}
+# cnv_tab<-data.frame()
+
+rerun_samples <-list.dirs("mapping",recursive = F)
+fsc_tab<-data.frame()
+fsd_tab<-data.frame()
+for (rerun_sample in rerun_samples){
+  samp_prefix = str_split(rerun_sample,"\\/",simplify = T)[2]
+
+  fsc_file = read.table(paste0(rerun_sample,"/fsc_table.txt"),sep='\t',header=T)
+  rownames(fsc_file)<-fsc_file[,1]
+  fsd_file = read.table(paste0(rerun_sample,"/fsd_table.txt"),sep='\t',header=T)
+  rownames(fsd_file)<-paste(fsd_file[,1],fsd_file[,2],sep=":")
+  fsc_tab[rownames(fsc_file),samp_prefix] = fsc_file[,2]
+  fsd_tab[rownames(fsd_file),samp_prefix] = fsd_file[,3]
+}
+
+cnv_tab<- na.omit(cnv_tab)
+
+fsd_tab<-subset(fsd_tab,rowMeans(fsd_tab)>10)
+fsd_tab2<-t(t(fsd_tab)/colSums(fsd_tab))*100000
+
+fsd_tab2<-fsd_tab2[,colnames(cnv_tab)]
+fsc_tab<-fsc_tab[,colnames(cnv_tab)]
+
+
+
+normal_cnv_tab<-cnv_tab[,intersect(colnames(cnv_tab),rownames(normal_sample_info))]
+early_cnv_tab<-cnv_tab[,intersect(colnames(cnv_tab),rownames(early_sample_info))]
+
+normal_fsd_tab<-fsd_tab2[,intersect(colnames(cnv_tab),rownames(normal_sample_info))]
+early_fsd_tab<-fsd_tab2[,intersect(colnames(cnv_tab),rownames(early_sample_info))]
+
+normal_fsc_tab<-fsc_tab[,intersect(colnames(cnv_tab),rownames(normal_sample_info))]
+early_fsc_tab<-fsc_tab[,intersect(colnames(cnv_tab),rownames(early_sample_info))]
+
+
+set.seed(1234)
+ 
+new_tab<-c()
+for (i in c(1:50)){
+  train_index1 = sample(c(1:78),58)
+  test_index1=setdiff(c(1:78),train_index1)
+
+  train_index2 = sample(c(1:99),74)
+ 
+  test_index2 = setdiff(c(1:99),train_index2)
+  x_train_cnv<-  t(cbind(early_cnv_tab[,train_index1],normal_cnv_tab[,train_index2]))
+  x_test_cnv <- t(cbind(early_cnv_tab[,test_index1],normal_cnv_tab[,test_index2]))
+  x_train_fsc<-  t(cbind(early_fsc_tab[,train_index1],normal_fsc_tab[,train_index2]))
+  x_test_fsc <- t(cbind(early_fsc_tab[,test_index1],normal_fsc_tab[,test_index2]))
+  x_train_fsd<-  t(cbind(early_fsd_tab[,train_index1],normal_fsd_tab[,train_index2]))
+  x_test_fsd <- t(cbind(early_fsd_tab[,test_index1],normal_fsd_tab[,test_index2]))
+  
+  y_train<-c(rep(1,58),rep(0,74))
+  y_test<-c(rep(1,20),rep(0,25))
+
+  elas_fit_cnv <- cv.glmnet(x=x_train_cnv,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  elas_pred_test_cnv <- predict(elas_fit_cnv, newx =x_test_cnv, type="response")
+  
+  elas_fit_fsc <- cv.glmnet(x=x_train_fsc,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  elas_pred_test_fsc <- predict(elas_fit_fsc, newx =x_test_fsc, type="response")
+  #elas_pred_train_fsc <- predict(elas_fit_fsc, newx =x_train_fsc, type="response")
+  
+  elas_fit_fsd <- cv.glmnet(x=x_train_fsd,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  elas_pred_test_fsd <- predict(elas_fit_fsd, newx =x_test_fsd, type="response")
+ 
+  new_tab <-rbind(new_tab,data.frame(cnv=elas_pred_test_cnv, fsc=elas_pred_test_fsc, fsd=elas_pred_test_fsd,label=y_test,sample=rownames(x_test_cnv)))
+  
+}
+
+auc_summary<-c()
+for (i in c(1:30)){
+  train_index = sample(c(1:nrow(new_tab)),round(nrow(new_tab)*0.75))
+  test_index=setdiff(c(1:nrow(new_tab)),train_index)
+  x_train = as.matrix(new_tab[train_index,1:3])
+  y_train = new_tab[train_index,4]
+  x_test = as.matrix(new_tab[test_index,1:3])
+  y_test = new_tab[test_index,4]
+  elas_fit <- cv.glmnet(x=x_train,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  elas_pred_test <- predict(elas_fit, newx =x_test, type="response")
+  pred <- prediction(as.numeric(as.matrix(elas_pred_test)), y_test)
+  perf <- performance(pred,"tpr","fpr")  
+  accu <- auc(y_test, as.numeric(as.matrix(elas_pred_test)))
+  
+  out_tab<- data.frame(pred=as.numeric(as.matrix(elas_pred_test)), label=y_test,sample=new_tab[test_index,5], mis_sample=round(abs(as.numeric(as.matrix(elas_pred_test))-y_test)))
+  out_tab$auc = accu
+  auc_summary<-rbind(auc_summary,out_tab)
+}
+
+auc_val<-round(pROC::auc(auc_summary$label,auc_summary$pred),3)
+
+roc<-pROC::roc(auc_summary$label,as.numeric(as.matrix(auc_summary$pred)))
+roc_ci<-ci(roc)
+
+pred <- prediction(as.numeric(auc_summary$pred), auc_summary$label)
+perf <- performance(pred,"tpr","fpr")
+perf_summary<- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste(",AUC:",auc_val,sep=""))
+p<-ggplot(perf_summary,aes(x=FPR,y=TPR,col=marker))+geom_line()+mytemp
+p
+
+
+colnames(new_tab)[1:3]<-c("cnv","fsc",'fsd')
+
+comb_tab1<- group_by(new_tab,sample) %>% summarise(cnv_score=mean(cnv), fsd_score=mean(fsd), fsc_score=mean(fsc))
+
+comb_tab2<- group_by(auc_summary,sample) %>% summarise(cancer_score=mean(pred), label=mean(label))
+comb_tab<-merge(comb_tab1,comb_tab2,by='sample')
+rownames(comb_tab)<-comb_tab[,1]
+comb_tab$PSA<-pc_sample_info3[rownames(comb_tab),]$PSA.x
+
+
+
+out_summary<-c()
+out_table<-c()
+
+
+for (labs in c(2,3,4,5,7)){  
+  auc_val<-round(pROC::auc(comb_tab$label,comb_tab[,labs]),3)
+
+  roc<-pROC::roc(comb_tab$label,as.numeric(as.matrix(comb_tab[,labs])))
+  roc_ci<-ci(roc)
+  tmp<-na.omit(comb_tab[,c(labs,6)])
+  pred <- prediction(as.numeric(tmp[,1]), tmp$label)
+  perf <- performance(pred,"tpr","fpr")
+  perf_summary<- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste(colnames(comb_tab)[labs],",AUC:",auc_val,"(",round(roc_ci[1],3),"-",round(roc_ci[3],3),")",sep=""))
+  out_summary<-rbind(out_summary,perf_summary)
+  
+}
+
+
+
+p<-ggplot(out_summary,aes(x=FPR,y=TPR,col=marker))+geom_line()+mytemp+scale_color_manual(values=basecol(5))
+p
+
+comb_tab2<-subset(comb_tab,PSA>4 & PSA<20)
+
+out_summary2<-c()
+for (labs in c(2,3,4,5,7)){  
+  auc_val<-round(pROC::auc(comb_tab2$label,comb_tab2[,labs]),3)
+
+  roc<-pROC::roc(comb_tab2$label,as.numeric(as.matrix(comb_tab2[,labs])))
+  roc_ci<-ci(roc)
+  tmp<-na.omit(comb_tab2[,c(labs,6)])
+  pred <- prediction(as.numeric(tmp[,1]), tmp$label)
+  perf <- performance(pred,"tpr","fpr")
+  perf_summary<- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste(colnames(comb_tab2)[labs],",AUC:",auc_val,"(",round(roc_ci[1],3),"-",round(roc_ci[3],3),")",sep=""))
+  out_summary2<-rbind(out_summary2,perf_summary)
+}
+
+
+p<-ggplot(out_summary2,aes(x=FPR,y=TPR,col=marker))+geom_line()+mytemp+scale_color_manual(values=basecol(5))
+p
+
+
+comb_tab$group<-pc_sample_info3[rownames(comb_tab),"Group"]
+p<-ggplot(comb_tab,aes(x=group,y=cancer_score,fill=group))+geom_violin(alpha=0.7)+mytemp+scale_fill_manual(values=basecol(4))+xlab(NULL)+ylab("Cancer score")
+p
+```
+
+
+
+```{r}
+library(caret)
+library(glmnet)
+
+
+set.seed(1234)
+test_index1_all = list(c(1:16),c(17:32),c(33:48),c(49:63),c(64:78))
+
+test_index2_all = list(c(1:20),c(21:40),c(41:60),c(61:80),c(81:99))
+
+cnv_model =list()
+fsc_model = list()
+fsd_model = list()
+new_tab<-c()
+for (i in c(1:5)){
+  test_index1 = test_index1_all[[i]]
+  test_index2 = test_index2_all[[i]]
+  train_index1=setdiff(c(1:78),test_index1)
+  train_index2 = setdiff(c(1:99),test_index2)
+  x_train_cnv<-  t(cbind(early_cnv_tab[,train_index1],normal_cnv_tab[,train_index2]))
+  x_test_cnv <- t(cbind(early_cnv_tab[,test_index1],normal_cnv_tab[,test_index2]))
+  x_train_fsc<-  t(cbind(early_fsc_tab[select_fsc,train_index1],normal_fsc_tab[select_fsc,train_index2]))
+  x_test_fsc <- t(cbind(early_fsc_tab[select_fsc,test_index1],normal_fsc_tab[select_fsc,test_index2]))
+  x_train_fsd<-  t(cbind(early_fsd_tab[,train_index1],normal_fsd_tab[,train_index2]))
+  x_test_fsd <- t(cbind(early_fsd_tab[,test_index1],normal_fsd_tab[,test_index2]))
+  
+  y_train<-c(rep(1,length(train_index1)),rep(0,length(train_index2)))
+  y_test<-c(rep(1,length(test_index1)),rep(0,length(test_index2)))
+  
+  elas_fit_cnv <- cv.glmnet(x=x_train_cnv,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  cnv_model[[i]] = elas_fit_cnv
+  elas_pred_test_cnv <- predict(elas_fit_cnv, newx =x_test_cnv, type="response")
+  
+  elas_fit_fsc <- cv.glmnet(x=x_train_fsc,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  fsc_model[[i]] = elas_fit_fsc
+  elas_pred_test_fsc <- predict(elas_fit_fsc, newx =x_test_fsc, type="response")
+
+  
+  elas_fit_fsd <- cv.glmnet(x=x_train_fsd,y=y_train, family = "binomial",
+                        type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+  fsd_model[[i]] = elas_fit_fsd
+  elas_pred_test_fsd <- predict(elas_fit_fsd, newx =x_test_fsd, type="response")
+  
+  new_tab <-rbind(new_tab,data.frame(cnv=elas_pred_test_cnv, fsc=elas_pred_test_fsc, fsd=elas_pred_test_fsd,label=y_test,sample=rownames(x_test_cnv)))
+}
+
+
+x_train = as.matrix(new_tab[,1:3])
+y_train = new_tab[,4]
+
+elas_fit <- cv.glmnet(x=x_train,y=y_train, family = "binomial",
+                      type.measure = "class", alpha = 0.5, nfolds=5, lambda = seq(0.01,0.05,by = 0.01))
+
+score_model = elas_fit
+select_cnv = rownames(early_cnv_tab)
+select_fsd = rownames(early_fsd_tab)
+
+
+
+rerun_samples_test <-list.dirs("fastq_path/",recursive = F)
+
+
+cnv_tab_test<-data.frame()
+fsc_tab_test<-data.frame()
+fsd_tab_test<-data.frame()
+for (rerun_sample in rerun_samples_test){
+  if (stringr::str_detect(rerun_sample,"Freg",TRUE)){
+    samp_prefix = str_split(rerun_sample,"\\/",simplify = T)[10]
+    cnv_file = read.table(paste0(rerun_sample,"/tumor_sample.cna.seg"),sep='\t',header=T)
+    rownames(cnv_file)=paste(cnv_file[,1],cnv_file[,2],cnv_file[,3],sep=":")
+    fsc_file = read.table(paste0(rerun_sample,"/fsc_table.txt"),sep='\t',header=T)
+    rownames(fsc_file)<-fsc_file[,1]
+    fsd_file = read.table(paste0(rerun_sample,"/fsd_table.txt"),sep='\t',header=T)
+    rownames(fsd_file)<-paste(fsd_file[,1],fsd_file[,2],sep=":")
+    cnv_tab_test[rownames(cnv_file),samp_prefix] = cnv_file[,6]
+    fsc_tab_test[rownames(fsc_file),samp_prefix] = fsc_file[,2]
+    fsd_tab_test[rownames(fsd_file),samp_prefix] = fsd_file[,3]
+  }
+}
+
+cnv_tab_test<- na.omit(cnv_tab_test)
+
+fsd_tab_test[is.na(fsd_tab_test)]<-0
+fsd_tab_test2<-t(t(fsd_tab_test)/colSums(fsd_tab_test))*100000
+
+
+colnames(cnv_tab_test)<-gsub("_IC","",gsub("-","_",colnames(cnv_tab_test)))
+colnames(fsd_tab_test2)<-colnames(cnv_tab_test)
+colnames(fsc_tab_test)<-colnames(cnv_tab_test)
+
+
+test_cnv<-cnv_tab_test[select_cnv,]
+test_fsc<-fsc_tab_test[select_fsc,]
+test_fsd<-fsd_tab_test2[select_fsd,]
+# test_fsd<-fsd_tab_test2
+cnv_score=c()
+fsc_score<-c()
+fsd_score<-c()
+for (i in c(1:5)){
+  cnv_score = cbind(cnv_score,predict(cnv_model[[i]], newx =t(as.matrix(test_cnv)), type="response"))
+  fsc_score = cbind(fsc_score,predict(fsc_model[[i]], newx =t(as.matrix(test_fsc)), type="response"))
+  fsd_score = cbind(fsd_score,predict(fsd_model[[i]], newx =t(as.matrix(test_fsd)), type="response"))
+}
+cnv_score<-rowMeans(cnv_score)
+fsd_score<-rowMeans(fsd_score)
+fsc_score<-rowMeans(fsc_score)
+
+
+label=c(rep(0,20),rep(1,20))
+final_pred_score = predict(score_model,newx=as.matrix(data.frame(a=cnv_score,b=fsc_score,c=fsd_score)), type="response")
+pROC::auc(label,as.matrix(final_pred_score)[,1])
+
+
+
+p_tab<-rbind(data.frame(score=final_pred_score,sample=rownames(final_pred_score),group=c(rep('non-cancer',20),rep("PCa",20))))
+colnames(p_tab)[1]<-'score'
+p<-ggplot(p_tab,aes(x=group,y=score,fill=group))+geom_violin(alpha=0.7)+mytemp+scale_fill_manual(values=basecol(4))+xlab(NULL)+ylab("Cancer score")
+p
+
+test_ic_match<-read.table("./test_samp_match.txt",sep='\t',row.names = 1,header = T)
+
+# 早期和PSA一起分析。
+p_tab2<-p_tab
+p_tab2$IP_name<-test_ic_match[rownames(p_tab2),'IP_name']
+p_tab2$PSA<-pc_sample_info[p_tab2$IP_name,'PSA']
+p_tab2<-cbind(p_tab2,data.frame(cnv=cnv_score,fsc=fsc_score,fsd=fsd_score))
+
+pred <- prediction(p_tab2[,1],c(rep(0,20),rep(1,20)))
+perf <- performance(pred,"tpr","fpr")  
+
+roc<-pROC::roc(c(rep(0,20),rep(1,20)),p_tab2[,1])
+roc_ci<-ci(roc)
+p_tmp1 <- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste("Cancer score,AUC:",round(roc_ci[2],3),"(",round(roc_ci[1],3),"-",round(roc_ci[3],3),")",sep=""))
+
+pred <- prediction(p_tab2[,5],c(rep(0,20),rep(1,20)))
+perf <- performance(pred,"tpr","fpr")  
+
+roc<-pROC::roc(c(rep(0,20),rep(1,20)),p_tab2[,5])
+roc_ci<-ci(roc)
+p_tmp2 <- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste("PSA,AUC:",round(roc_ci[2],3),"(",round(roc_ci[1],3),"-",round(roc_ci[3],3),")",sep=""))
+# 转移
+pred <- prediction(p_tab[1:40,1],c(rep(1,20),rep(0,20)))
+perf <- performance(pred,"tpr","fpr")  
+
+roc<-pROC::roc(c(rep(1,20),rep(0,20)),p_tab[1:40,1])
+roc_ci<-ci(roc)
+
+plot_tab<-rbind(p_tmp1,p_tmp2)
+p<-ggplot(plot_tab,aes(x=FPR,y=TPR,col=marker))+geom_line()+mytemp+scale_color_manual(values = basecol(2))
+p
+
+p_tab3<-subset(p_tab2,PSA>4 & PSA<20)
+
+pred <- prediction(p_tab3[,1],c(rep(0,10),rep(1,13)))
+perf <- performance(pred,"tpr","fpr")  
+
+roc<-pROC::roc(c(rep(0,10),rep(1,13)),p_tab3[,1])
+roc_ci<-ci(roc)
+p_tmp1 <- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste("Cancer score,AUC:",round(roc_ci[2],3),"(",round(roc_ci[1],3),"-",round(roc_ci[3],3),")",sep=""))
+
+pred <- prediction(p_tab3[,5],c(rep(0,10),rep(1,13)))
+perf <- performance(pred,"tpr","fpr")  
+
+roc<-pROC::roc(c(rep(0,10),rep(1,13)),p_tab3[,5])
+roc_ci<-ci(roc)
+p_tmp2 <- data.frame(FPR=as.numeric(perf@x.values[[1]]),TPR=as.numeric(perf@y.values[[1]]),marker=paste("PSA,AUC:",round(roc_ci[2],3),"(",round(roc_ci[1],3),"-",round(roc_ci[3],3),")",sep=""))
+plot_tab<-rbind(p_tmp1,p_tmp2)
+p<-ggplot(plot_tab,aes(x=FPR,y=TPR,col=marker))+geom_line()+mytemp+scale_color_manual(values = basecol(2))
+p
+```
+
+
