@@ -2,7 +2,9 @@
 
 This folder includes mapping, modelling and plot scripts for manuscript.
 
-### requirements
+
+
+### Requirements
 - readCounter: https://github.com/shahcompbio/hmmcopy_utils
 - ichorCNA: https://github.com/broadinstitute/ichorCNA
 - samtools: http://www.htslib.org/
